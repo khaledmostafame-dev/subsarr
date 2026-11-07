@@ -61,7 +61,7 @@ type Store interface {
 func New(db *sql.DB, driver string) (Store, error) {
 	switch driver {
 	case "sqlite":
-		return &sqliteStore{q: sqlitedb.New(db), db: db}, nil
+		return &sqliteStore{q: sqlitedb.New(db), db: db, fts: ensureSearchIndex(db)}, nil
 	case "postgres":
 		return &pgStore{q: pgdb.New(db), db: db}, nil
 	case "mysql":

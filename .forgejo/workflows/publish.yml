@@ -1,0 +1,35 @@
+name: Build & publish image
+
+# Forgejo Actions on the NAS -- see Synology/Forgejo-self-hosted-runbook.md.
+# Images build here (never GitHub/GHCR/Docker Hub) and go to the self-hosted registry.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to registry
+        run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login git.khaled.synology.me -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Build and push image
+        run: |
+          REG=git.khaled.synology.me/khaledmostafame-dev
+          SHORT=$(git rev-parse --short HEAD)
+          docker build --label org.opencontainers.image.revision=${{ github.sha }} \
+            -t $REG/subsarr:latest -t $REG/subsarr:$SHORT .
+          docker push $REG/subsarr:latest
+          docker push $REG/subsarr:$SHORT
+
+      # Non-fatal: 201=linked, 409=already linked.
+      - name: Link package to repo
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: token ${{ secrets.REGISTRY_TOKEN }}" \
+            "https://git.khaled.synology.me/api/v1/packages/khaledmostafame-dev/container/subsarr/-/link/subsarr" \
+            || echo curl-failed)
+          echo "link subsarr -> subsarr : $code"
