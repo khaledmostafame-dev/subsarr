@@ -480,3 +480,57 @@ func TestNew_UnsupportedDriver(t *testing.T) {
 		t.Error("expected error for unsupported driver")
 	}
 }
+
+// ─── Search index ────────────────────────────────────────────────────────────
+
+func TestSearchIndex_BuiltFromExistingRowsAndKeptInSync(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Rows that exist before the store (and its index) are created.
+	if _, err := db.Exec(`INSERT INTO subtitles (id, subscene_id, title, language, filename, content_hash)
+		VALUES ('old', 'o1', 'Inception', 'english', 'inception.2010.srt', 'h-old')`); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := New(db, "sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.(*sqliteStore).fts {
+		t.Fatal("search index not created (built without sqlite_fts5?)")
+	}
+
+	// Pre-existing row found via the rebuilt index, case-insensitive substring.
+	res, total, err := st.SearchSubtitles(ctx, SearchParams{Query: "CEPTi", Limit: 10})
+	if err != nil || total != 1 || len(res) != 1 || res[0].ID != "old" {
+		t.Fatalf("old row: res=%v total=%d err=%v", res, total, err)
+	}
+
+	// Insert trigger.
+	st.InsertSubtitle(ctx, makeSub("new", "Tenet", "english"))
+	if res, _, _ := st.SearchSubtitles(ctx, SearchParams{Query: "tenet", Limit: 10}); len(res) != 1 {
+		t.Fatalf("inserted row not indexed: %v", res)
+	}
+
+	// Delete trigger.
+	db.Exec(`DELETE FROM subtitles WHERE id = 'old'`)
+	if res, _, _ := st.SearchSubtitles(ctx, SearchParams{Query: "inception", Limit: 10}); len(res) != 0 {
+		t.Fatalf("deleted row still matched: %v", res)
+	}
+
+	// Quotes in the term must not break the MATCH syntax.
+	if _, _, err := st.SearchSubtitles(ctx, SearchParams{Query: `te"net`, Limit: 10}); err != nil {
+		t.Fatalf("quoted term: %v", err)
+	}
+
+	// Terms under 3 chars fall back to LIKE.
+	if res, _, _ := st.SearchSubtitles(ctx, SearchParams{Query: "te", Limit: 10}); len(res) != 1 {
+		t.Fatalf("short term fallback: %v", res)
+	}
+
+	// Re-opening does not rebuild or fail.
+	if st2, err := New(db, "sqlite"); err != nil || !st2.(*sqliteStore).fts {
+		t.Fatalf("reopen: %v", err)
+	}
+}

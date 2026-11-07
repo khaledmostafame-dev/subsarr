@@ -3,14 +3,73 @@ package store
 import (
 	"context"
 	"database/sql"
+	"log"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/slimcdk/subsarr/internal/database/sqlitedb"
 )
 
 type sqliteStore struct {
-	q  *sqlitedb.Queries
-	db *sql.DB
+	q   *sqlitedb.Queries
+	db  *sql.DB
+	fts bool // subtitles_fts trigram index is available
+}
+
+// ftsSchema is a trigram FTS5 index over the searched text columns. Trigram
+// MATCH on a quoted phrase is a case-insensitive substring match, the same
+// semantics as LIKE '%term%', but served from the index instead of a scan.
+// shortcut: keyed on the implicit rowid, which VACUUM may renumber; after a
+// VACUUM, DROP TABLE subtitles_fts and restart so it is rebuilt.
+const ftsSchema = `
+CREATE VIRTUAL TABLE IF NOT EXISTS subtitles_fts USING fts5(
+    title, filename, releases,
+    content='subtitles', content_rowid='rowid', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS subtitles_fts_ai AFTER INSERT ON subtitles BEGIN
+    INSERT INTO subtitles_fts(rowid, title, filename, releases)
+    VALUES (new.rowid, new.title, new.filename, new.releases);
+END;
+CREATE TRIGGER IF NOT EXISTS subtitles_fts_ad AFTER DELETE ON subtitles BEGIN
+    INSERT INTO subtitles_fts(subtitles_fts, rowid, title, filename, releases)
+    VALUES ('delete', old.rowid, old.title, old.filename, old.releases);
+END;
+CREATE TRIGGER IF NOT EXISTS subtitles_fts_au AFTER UPDATE OF title, filename, releases ON subtitles BEGIN
+    INSERT INTO subtitles_fts(subtitles_fts, rowid, title, filename, releases)
+    VALUES ('delete', old.rowid, old.title, old.filename, old.releases);
+    INSERT INTO subtitles_fts(rowid, title, filename, releases)
+    VALUES (new.rowid, new.title, new.filename, new.releases);
+END;`
+
+// ensureSearchIndex creates the FTS index (building it from existing rows the
+// first time) and reports whether searches can use it.
+func ensureSearchIndex(db *sql.DB) bool {
+	var exists int
+	db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name = 'subtitles_fts'").Scan(&exists)
+	if _, err := db.Exec(ftsSchema); err != nil {
+		log.Printf("search index unavailable, using LIKE scans: %v", err)
+		return false
+	}
+	if exists == 0 {
+		start := time.Now()
+		log.Printf("building search index (one-time)...")
+		if _, err := db.Exec("INSERT INTO subtitles_fts(subtitles_fts) VALUES('rebuild')"); err != nil {
+			log.Printf("search index build failed, using LIKE scans: %v", err)
+			db.Exec("DROP TABLE IF EXISTS subtitles_fts") // retry on next start
+			return false
+		}
+		log.Printf("search index built in %s", time.Since(start).Round(time.Second))
+	}
+	return true
+}
+
+// ftsMatch returns an FTS5 MATCH expression for a substring search of term in
+// cols, or "" when the index can't serve it (trigrams need 3+ characters).
+func (s *sqliteStore) ftsMatch(cols, term string) string {
+	if !s.fts || utf8.RuneCountInString(term) < 3 {
+		return ""
+	}
+	return "{" + cols + "}: \"" + strings.ReplaceAll(term, `"`, `""`) + "\""
 }
 
 func (s *sqliteStore) GetSubtitle(ctx context.Context, id string) (*Subtitle, error) {
@@ -157,14 +216,24 @@ func (s *sqliteStore) SearchSubtitles(ctx context.Context, p SearchParams) ([]Su
 		args = append(args, p.Year)
 	}
 	if p.Query != "" {
-		pattern := "%" + p.Query + "%"
-		where = append(where, "(title LIKE ? OR filename LIKE ?)")
-		args = append(args, pattern, pattern)
+		if m := s.ftsMatch("title filename", p.Query); m != "" {
+			where = append(where, "rowid IN (SELECT rowid FROM subtitles_fts WHERE subtitles_fts MATCH ?)")
+			args = append(args, m)
+		} else {
+			pattern := "%" + p.Query + "%"
+			where = append(where, "(title LIKE ? OR filename LIKE ?)")
+			args = append(args, pattern, pattern)
+		}
 	}
 	if p.SeasonEp != "" {
-		pattern := "%" + p.SeasonEp + "%"
-		where = append(where, "(releases LIKE ? OR filename LIKE ?)")
-		args = append(args, pattern, pattern)
+		if m := s.ftsMatch("releases filename", p.SeasonEp); m != "" {
+			where = append(where, "rowid IN (SELECT rowid FROM subtitles_fts WHERE subtitles_fts MATCH ?)")
+			args = append(args, m)
+		} else {
+			pattern := "%" + p.SeasonEp + "%"
+			where = append(where, "(releases LIKE ? OR filename LIKE ?)")
+			args = append(args, pattern, pattern)
+		}
 	}
 
 	whereClause := ""
